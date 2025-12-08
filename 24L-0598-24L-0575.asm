@@ -1,6 +1,8 @@
 ;24L-0598 & 24L-0575
 [org 0x0100]
 
+;bit blazer race game
+
 SCR_WIDTH   equ 320
 SCR_HEIGHT  equ 200
 VIDSEG      equ 0A000h
@@ -16,9 +18,9 @@ COL_ASPHALT    equ 8
 COL_LANEYELLOW equ 14
 COL_BORDER     equ 7
 
-; coin sprite (from coin.inc: width=20, height=30, 0 = transparent)
+; coin sprite (from coin.inc: width=20, height=20, 0 = transparent)
 COINW       equ 20
-COINH       equ 30
+COINH       equ 20
 COIN_HALFW  equ COINW/2
 COIN_HALFH  equ COINH/2
 COIN_HALF   equ COIN_HALFH
@@ -39,6 +41,24 @@ REASON_NONE  equ 0
 REASON_QUIT  equ 1
 REASON_FUEL  equ 2
 REASON_CRASH equ 3
+
+; fuel tank sprite (from fueltank.inc: width=17, height=20, -1 = transparent)
+FUELW        equ 17
+FUELH        equ 20
+FUEL_HALFW   equ FUELW/2        ; 8
+FUEL_HALFH   equ FUELH/2        ; 10
+
+; collision box around fuel center (square)
+FUEL_COLL_HALF  equ FUELW/2
+FUEL_COLL_SIZE  equ FUEL_COLL_HALF*2
+
+; fuel movement / spawn settings
+FUEL_SCROLL        equ 12        ; same as coin scroll
+FUEL_RESPAWN_DELAY equ 120       ; normal delay
+FUEL_RESPAWN_LOW   equ 40        ; faster when fuel is low
+FUEL_LOW_THRESHOLD equ 5         ; "low fuel" if <= 5
+FUEL_GAIN          equ 5         ; fuel gained per pickup
+FUEL_MAX equ 12
 
 
 ; start game
@@ -208,6 +228,12 @@ set_redy_done:
     mov word [coin_count], 0
     mov word [fuel_value], 12
 
+    ; setup fuel initially (all inactive, spawn timer started)
+    mov word [fuel_active], 0
+    mov word [fuel_active+2], 0
+    mov word [fuel_active+4], 0
+    mov word [fuel_spawn_timer], FUEL_RESPAWN_DELAY
+
     ; hide cursor
     mov ah, 01h
     mov ch, 32
@@ -254,11 +280,18 @@ game_loop:
     call erase_all_blue_cars
     call update_all_blue_cars
     call update_coins
+    call update_fuel
     call draw_all_blue_cars
 
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
+
+; reduce movement cooldown
+    cmp word [move_cooldown], 0
+    jle skip_cooldown_reduce
+    dec word [move_cooldown]
+    skip_cooldown_reduce:
 
     mov ah, 01h
     int 16h
@@ -274,16 +307,16 @@ game_loop:
     jne near no_key
 
     cmp ah, 4Bh
-    je key_move_left
+    je key_move_left_try
 
     cmp ah, 4Dh
-    je key_move_right
+    je key_move_right_try
 	
     cmp ah, 48h
-    je key_move_up
+    je key_move_up_try
 
     cmp ah, 50h
-    je key_move_down
+    je key_move_down_try
 
     jmp no_key
 
@@ -299,7 +332,47 @@ key_escape_confirmed:
     mov byte [end_reason], REASON_QUIT
     jmp game_over_mode
 
+key_move_left_try:
+    cmp word [move_cooldown], 0
+    jne near after_keys       ; still cooling down → ignore key
+    jmp key_move_left
+
+key_move_right_try:
+    cmp word [move_cooldown], 0
+    jne near after_keys
+    jmp key_move_right
+
+key_move_up_try:
+    cmp word [move_cooldown], 0
+    jne near after_keys
+    jmp key_move_up
+
+key_move_down_try:
+    cmp word [move_cooldown], 0
+    jne near after_keys
+    jmp key_move_down
+
 key_move_left:
+    ; check if changing into left lane would crash
+    mov al, [red_lane]
+    cmp al, 0
+    je key_move_left_do_move      ; already leftmost lane, no side-lane change
+    dec al                        ; target lane = current - 1
+    call check_side_lane_collision
+    cmp al, 1
+    jne key_move_left_do_move
+
+    ; lane-change collision: keep car in same lane, show sparks, end game
+    call draw_spark
+    mov cx, 30000
+kml_spark_delay:
+    loop kml_spark_delay
+
+    mov word [game_over_flag], 1
+    mov byte [end_reason], REASON_CRASH
+    jmp game_over_mode
+
+key_move_left_do_move:
     mov cx, [redx]
     mov dx, [redy]
     call erase_car
@@ -307,9 +380,30 @@ key_move_left:
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
-    jmp after_keys
+    mov word [move_cooldown], 3   ; cooldown frames
+    jmp near do_fuel_tick
 
 key_move_right:
+    ; check if changing into right lane would crash
+    mov al, [red_lane]
+    cmp al, 2
+    je key_move_right_do_move     ; already rightmost lane
+    inc al                        ; target lane = current + 1
+    call check_side_lane_collision
+    cmp al, 1
+    jne key_move_right_do_move
+
+    ; lane-change collision: keep car in same lane, show sparks, end game
+    call draw_spark
+    mov cx, 30000
+kmr_spark_delay:
+    loop kmr_spark_delay
+
+    mov word [game_over_flag], 1
+    mov byte [end_reason], REASON_CRASH
+    jmp game_over_mode
+
+key_move_right_do_move:
     mov cx, [redx]
     mov dx, [redy]
     call erase_car
@@ -317,7 +411,8 @@ key_move_right:
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
-    jmp after_keys
+    mov word [move_cooldown], 3
+    jmp near do_fuel_tick
 
 key_move_up:
     mov cx, [redx]
@@ -327,7 +422,8 @@ key_move_up:
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
-    jmp after_keys
+    mov word [move_cooldown], 3
+    jmp near do_fuel_tick
 
 key_move_down:
     mov cx, [redx]
@@ -337,7 +433,8 @@ key_move_down:
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
-    jmp after_keys
+    mov word [move_cooldown], 3
+    jmp near do_fuel_tick
 
 move_red_up:
     push ax
@@ -371,6 +468,32 @@ mrd_done:
     ret
 
 no_key:
+    jmp do_fuel_tick
+
+; TIMER-BASED FUEL DROP (runs every frame)
+do_fuel_tick:
+    dec word [fuel_tick]
+    jnz fuel_tick_done       ; not yet
+
+    mov word [fuel_tick], 20 ; reset timer
+
+    ; reduce fuel by 1
+    cmp word [fuel_value], 0
+    je fuel_empty_now_tick
+    dec word [fuel_value]
+
+    call draw_fuel_text
+    call draw_fuel_hud
+
+    cmp word [fuel_value], 0
+    jne fuel_tick_done
+
+fuel_empty_now_tick:
+    mov word [game_over_flag], 1
+    mov byte [end_reason], REASON_FUEL
+    jmp game_over_mode
+
+fuel_tick_done:
 
 after_keys:
     call check_blue_collisions
@@ -872,6 +995,7 @@ update_coins:
     dec word [coin_spawn_timer]
     jmp coin_after_spawn
 
+
 coin_do_spawn:
     call spawn_coin_once
     mov word [coin_spawn_timer], COIN_RESPAWN_DELAY
@@ -943,6 +1067,482 @@ coin_next:
     pop ax
     ret
 
+; draw fuel tank sprite (17x20) centered at AX,DX
+; fueltank data uses -1 as transparent
+draw_fuel_tank:
+    ; AX = center X, DX = center Y
+    sub ax, FUEL_HALFW
+    sub dx, FUEL_HALFH
+    mov [fuel_base_x], ax
+    mov [fuel_base_y], dx
+
+    pusha
+
+    mov si, fueltank
+    xor bx, bx          ; row counter
+
+fuel_draw_row:
+    cmp bx, FUELH
+    jge fuel_draw_done
+
+    mov ax, [fuel_base_y]
+    add ax, bx
+    cmp ax, 0
+    jl fuel_skip_row
+    cmp ax, SCR_HEIGHT
+    jge fuel_draw_done
+
+    mov cx, SCR_WIDTH
+    mul cx
+    mov di, ax
+    mov ax, [fuel_base_x]
+    add di, ax
+
+    mov cx, FUELW
+
+fuel_draw_col:
+    lodsb
+    cmp al, -1          ; -1 = transparent
+    je fuel_skip_px
+    mov [es:di], al
+fuel_skip_px:
+    inc di
+    loop fuel_draw_col
+
+fuel_skip_row:
+    inc bx
+    jmp fuel_draw_row
+
+fuel_draw_done:
+    popa
+    ret
+
+; check if fuel at CX,DX collides with red car
+; returns AL = 1 if hit, 0 otherwise
+check_fuel_collision:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    
+    mov si, [redx]
+    mov di, si
+    add di, CARW
+    
+    mov bp, [redy]
+    mov bx, bp
+    add bx, CARH
+    
+    push cx
+    push dx
+    
+    sub cx, FUEL_COLL_HALF
+    mov ax, cx
+    add ax, FUEL_COLL_SIZE
+    
+    sub dx, FUEL_COLL_HALF
+    push dx
+    add dx, FUEL_COLL_SIZE
+    
+    cmp ax, si
+    jl fuel_no_collision_clean
+    
+    cmp cx, di
+    jg fuel_no_collision_clean
+    
+    cmp dx, bp
+    jl fuel_no_collision_clean
+    
+    pop ax
+    cmp ax, bx
+    jg fuel_no_collision_pop
+    
+    pop dx
+    pop cx
+    mov al, 1
+    jmp fuel_collision_done
+    
+fuel_no_collision_clean:
+    pop ax
+fuel_no_collision_pop:
+    pop dx
+    pop cx
+    mov al, 0
+    
+fuel_collision_done:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; erase a fuel tank area around center CX,DX
+erase_fuel_at:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+
+    ; convert center to top-left
+    sub cx, FUEL_HALFW
+    sub dx, FUEL_HALFH
+    mov [fuel_base_x], cx
+    mov [fuel_base_y], dx
+
+    xor si, si              ; row index 0..FUELH-1
+
+ef_row_loop:
+    mov ax, [fuel_base_y]
+    add ax, si              ; current y
+    mov bp, ax              ; bp = y
+
+    mov bx, SCR_WIDTH
+    mul bx                  ; ax = y * 320
+    mov di, ax
+    mov ax, [fuel_base_x]
+    add di, ax              ; di = video offset
+
+    mov bx, [fuel_base_x]   ; bx = x for this row
+    mov cx, FUELW           ; cx = number of columns
+
+ef_col_loop:
+    ; check overlap with red car bounding box
+    mov ax, [redx]
+    cmp bx, ax
+    jb ef_not_red
+    mov dx, ax
+    add dx, CARW
+    cmp bx, dx
+    jae ef_not_red
+
+    mov ax, bp
+    cmp ax, [redy]
+    jb ef_not_red
+    mov dx, [redy]
+    add dx, CARH
+    cmp ax, dx
+    jae ef_not_red
+
+    ; inside red car → restore car pixel if non-transparent
+    mov ax, bp
+    sub ax, [redy]
+    mov dx, CARW
+    mul dx
+    mov dx, bx
+    sub dx, [redx]
+    add ax, dx
+    push si
+    mov si, car_sprite
+    add si, ax
+    mov al, [si]
+    pop si
+    or  al, al
+    jz ef_not_red
+    jmp ef_write_pixel
+
+ef_not_red:
+    ; background (road / lane / border / grass)
+    cmp bx, ROADL
+    jb ef_grass
+    cmp bx, ROADR
+    ja ef_grass
+
+    mov ax, bx
+    sub ax, ROADL
+    cmp ax, BORDERW
+    jb ef_border
+
+    mov ax, ROADR
+    sub ax, bx
+    cmp ax, BORDERW
+    jb ef_border
+
+    cmp bx, [lane1]
+    je ef_lane
+    cmp bx, [lane2]
+    je ef_lane
+
+    mov al, COL_ASPHALT
+    jmp ef_write_pixel
+
+ef_border:
+    mov al, COL_BORDER
+    jmp ef_write_pixel
+
+ef_lane:
+    test bp, 3
+    jnz ef_lane_asphalt
+    mov al, COL_LANEYELLOW
+    jmp ef_write_pixel
+
+ef_lane_asphalt:
+    mov al, COL_ASPHALT
+    jmp ef_write_pixel
+
+ef_grass:
+    mov al, 0
+
+ef_write_pixel:
+    mov [es:di], al
+    inc di
+    inc bx
+    dec cx
+    jnz ef_col_loop
+
+    inc si
+    cmp si, FUELH
+    jb ef_row_loop
+
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; fuel: erase, move, collision, respawn, draw
+update_fuel:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    ; spawn timer
+    cmp word [fuel_spawn_timer], 0
+    jle fuel_do_spawn
+    dec word [fuel_spawn_timer]
+    jmp fuel_after_spawn
+
+fuel_do_spawn:
+    call spawn_fuel_once
+    mov ax, [fuel_value]
+    cmp ax, FUEL_LOW_THRESHOLD
+    jle fuel_set_low_delay
+    mov word [fuel_spawn_timer], FUEL_RESPAWN_DELAY
+    jmp fuel_after_spawn
+
+fuel_set_low_delay:
+    mov word [fuel_spawn_timer], FUEL_RESPAWN_LOW
+
+fuel_after_spawn:
+    xor si, si
+
+fuel_loop:
+    mov bx, si
+    shl bx, 1
+
+    mov ax, [fuel_active + bx]
+    cmp ax, 0
+    je fuel_next
+
+    ; erase old
+    mov ax, [fuel_x + bx]
+    mov cx, ax
+    mov ax, [fuel_y + bx]
+    mov dx, ax
+    call erase_fuel_at
+
+    ; move down
+    mov ax, [fuel_y + bx]
+    add ax, FUEL_SCROLL
+    mov [fuel_y + bx], ax
+
+    cmp ax, SCR_HEIGHT
+    jae fuel_deactivate
+
+    ; check collision with red car
+    mov ax, [fuel_x + bx]
+    mov cx, ax
+    mov dx, [fuel_y + bx]
+    call check_fuel_collision
+    cmp al, 1
+    jne fuel_no_hit
+
+    ; hit: erase, redraw car, add fuel
+    mov ax, [fuel_x + bx]
+    mov cx, ax
+    mov dx, [fuel_y + bx]
+    call erase_fuel_at
+
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+
+    ; add fuel (clamped to FUEL_MAX)
+    mov ax, [fuel_value]
+    add ax, FUEL_GAIN
+    cmp ax, FUEL_MAX
+    jle uf_store
+    mov ax, FUEL_MAX
+uf_store:
+    mov [fuel_value], ax
+    call draw_fuel_text
+    call draw_fuel_hud
+
+
+    jmp fuel_deactivate
+
+fuel_no_hit:
+    mov ax, [fuel_x + bx]
+    mov dx, [fuel_y + bx]
+    call draw_fuel_tank
+    jmp fuel_after_entry
+
+fuel_deactivate:
+    mov word [fuel_active + bx], 0
+
+fuel_after_entry:
+fuel_next:
+    inc si
+    cmp si, 3
+    jb fuel_loop
+
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; choose a random inactive lane and spawn one fuel tank
+spawn_fuel_once:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    ; ----- 1. Find an inactive slot -----
+    mov si, 0
+    mov cx, 3
+
+sfu_check_inactive:
+    mov bx, si
+    shl bx, 1
+    mov ax, [fuel_active + bx]
+    cmp ax, 0
+    je sfu_use_slot          ; found free slot
+    inc si
+    loop sfu_check_inactive
+
+    ; ----- 2. No inactive slot -> force replace lane 0 -----
+    mov si, 0
+    mov bx, 0
+
+sfu_use_slot:
+    mov [spawn_lane], si
+    call spawn_fuel_lane
+
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; spawn fuel in lane SI, try to avoid overlap with blue cars
+spawn_fuel_lane:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+
+    mov dl, byte [spawn_lane]      ; lane index in DL
+
+    mov bx, si
+    shl bx, 1
+
+    cmp si, 0
+    je sfl_lane0
+    cmp si, 1
+    je sfl_lane1
+    mov ax, [lanec3]
+    jmp sfl_store_x
+
+sfl_lane1:
+    mov ax, [lanec2]
+    jmp sfl_store_x
+
+sfl_lane0:
+    mov ax, [lanec1]
+
+sfl_store_x:
+    mov [fuel_x + bx], ax
+
+    ; try to position relative to any blue car in this lane
+    xor di, di
+sfl_check_blue:
+    push bx
+    mov si, di
+    call get_blue_car_ptr
+
+    mov ax, [bx]
+    cmp ax, 0
+    je sfl_next_blue
+
+    mov al, [bx + 8]       ; car's lane index
+    cmp al, dl
+    jne sfl_next_blue
+
+    mov ax, [bx + 6]       ; car bottom y
+    add ax, 32             ; place fuel some distance below
+
+    cmp ax, SCR_HEIGHT - 40
+    jbe sfl_candidate
+
+    push bx
+    mov bx, 50
+    call getrandom
+    add ax, FUEL_HALFH
+    pop bx
+    jmp sfl_store_y
+
+sfl_candidate:
+    cmp ax, SCR_HEIGHT - FUEL_HALFH
+    jbe sfl_store_y
+    mov ax, SCR_HEIGHT - FUEL_HALFH
+
+sfl_store_y:
+    pop bx
+    mov [fuel_y + bx], ax
+    jmp sfl_activate
+
+sfl_next_blue:
+    pop bx
+    inc di
+    cmp di, MAX_BLUE_CARS
+    jb sfl_check_blue
+
+    ; no matching blue car, pick a random height near top
+    push bx
+    mov bx, 50
+    call getrandom
+    add ax, FUEL_HALFH
+    pop bx
+    mov [fuel_y + bx], ax
+
+sfl_activate:
+    mov word [fuel_active + bx], 1
+
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
 
 ; choose a random inactive lane and spawn one coin
 spawn_coin_once:
@@ -952,40 +1552,31 @@ spawn_coin_once:
     push dx
     push si
 
+    ; ----- 1. find an inactive coin slot -----
     mov si, 0
     mov cx, 3
 
-spawn_coin_check_inactive:
+sco_check_slot:
     mov bx, si
     shl bx, 1
     mov ax, [coin_active + bx]
     cmp ax, 0
-    je spawn_coin_found_inactive
+    je sco_use_slot
     inc si
-    loop spawn_coin_check_inactive
+    loop sco_check_slot
 
-    jmp near spawn_coin_done
+    ; no free slot → force use slot 0
+    mov si, 0
+    mov bx, 0
 
-spawn_coin_found_inactive:
-    mov cx, 3
-
-spawn_coin_try_lane:
+sco_use_slot:
+    ; choose random lane 0..2
     mov bx, 3
     call getrandom
-    mov si, ax
+    mov [spawn_lane], ax   ; store lane index
 
-    mov bx, si
-    shl bx, 1
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    je spawn_coin_do
-    loop spawn_coin_try_lane
-    jmp near spawn_coin_done
+    call spawn_coin_lane   ; do actual spawn
 
-spawn_coin_do:
-    call spawn_coin_lane
-
-spawn_coin_done:
     pop si
     pop dx
     pop cx
@@ -993,102 +1584,91 @@ spawn_coin_done:
     pop ax
     ret
 
-
-; spawn coin in lane SI, avoid overlap with blue cars if possible
+; choose a random inactive lane and spawn one coin
+; spawn coin in lane SI, avoid overlap with blue cars safely
 spawn_coin_lane:
     push ax
     push bx
     push cx
     push dx
     push di
+    push bp
 
+    mov dl, [spawn_lane]      ; lane index 0..2
+
+    ; bp = offset into coin arrays (si * 2)
     mov bx, si
     shl bx, 1
+    mov bp, bx
 
+    ; pick X center based on lane
     cmp si, 0
-    je spawn_coin_lane0
+    je scl_lane0
     cmp si, 1
-    je spawn_coin_lane1
+    je scl_lane1
     mov ax, [lanec3]
-    jmp spawn_coin_store_x
+    jmp scl_store_x
 
-spawn_coin_lane1:
+scl_lane1:
     mov ax, [lanec2]
-    jmp spawn_coin_store_x
+    jmp scl_store_x
 
-spawn_coin_lane0:
+scl_lane0:
     mov ax, [lanec1]
 
-spawn_coin_store_x:
-    mov [coin_x + bx], ax
+scl_store_x:
+    mov [coin_x + bp], ax
 
-    ; try to position relative to any blue car in this lane
-    push si
+    ; try to place above a blue car in same lane
     xor di, di
-spawn_coin_check_blue:
-    push bx
-    mov si, di
-    call get_blue_car_ptr
 
-    mov ax, [bx]
-    cmp ax, 0
-    je spawn_coin_next_blue
-
-    mov al, [bx + 8]
-    pop bx
-    push bx
-    cmp al, [si]
-    jne spawn_coin_next_blue
-
-    mov ax, [bx + 6]
-    add ax, 32
-
-    cmp ax, SCR_HEIGHT - 40
-    jbe spawn_coin_candidate
-
-    push bx
-    mov bx, 50
-    call getrandom
-    add ax, COIN_HALFH
-    pop bx
-    jmp spawn_coin_store_y
-
-spawn_coin_candidate:
-    cmp ax, SCR_HEIGHT - COIN_HALFH
-    jbe spawn_coin_store_y
-    mov ax, SCR_HEIGHT - COIN_HALFH
-
-spawn_coin_store_y:
-    pop bx
-    pop si
-    mov [coin_y + bx], ax
-    jmp spawn_coin_activate
-
-spawn_coin_next_blue:
-    pop bx
-    inc di
+scl_check_blue:
     cmp di, MAX_BLUE_CARS
-    jb spawn_coin_check_blue
+    jae scl_no_blue_same_lane
 
-    pop si
+    mov si, di
+    call get_blue_car_ptr     ; BX = pointer to this blue car
 
-    push bx
+    mov ax, [bx]              ; active?
+    cmp ax, 0
+    je scl_next_blue
+
+    mov al, [bx + 8]          ; car lane index
+    cmp al, dl
+    jne scl_next_blue
+
+    ; place coin above this blue car
+    mov ax, [bx + 4]          ; car top Y
+    sub ax, COINH             ; coin goes above it
+    cmp ax, 20
+    jge scl_y_ok
+    mov ax, 20
+scl_y_ok:
+    mov [coin_y + bp], ax
+    jmp scl_activate
+
+scl_next_blue:
+    inc di
+    jmp scl_check_blue
+
+
+; no matching blue car → random height
+scl_no_blue_same_lane:
     mov bx, 50
-    call getrandom
+    call getrandom            ; ax = 0..49
     add ax, COIN_HALFH
-    pop bx
-    mov [coin_y + bx], ax
+    mov [coin_y + bp], ax
 
-spawn_coin_activate:
-    mov word [coin_active + bx], 1
+scl_activate:
+    mov word [coin_active + bp], 1
 
+    pop bp
     pop di
     pop dx
     pop cx
     pop bx
     pop ax
     ret
-
 
 ; check if coin at CX,DX collides with red car
 check_coin_collision:
@@ -1354,6 +1934,147 @@ move_red_right_store:
     pop ax
     ret
 
+; draw simple spark burst around the red car center
+draw_spark:
+    pusha
+
+    ; make sure ES points to VGA memory
+    mov ax, VIDSEG
+    mov es, ax
+
+    ; center of red car
+    mov ax, [redx]
+    add ax, CARHALFW
+    mov si, ax              ; center x
+
+    mov ax, CARH
+    shr ax, 1
+    add ax, [redy]
+    mov di, ax              ; center y
+
+    mov cx, 25              ; number of spark pixels
+
+spark_loop:
+    ; random x offset in range -8..+7
+    mov bx, 16
+    call getrandom          ; ax = 0..15
+    sub ax, 8
+    add ax, si              ; ax = x
+
+    ; clamp x to 0..SCR_WIDTH-1
+    cmp ax, 0
+    jl spark_next
+    cmp ax, SCR_WIDTH-1
+    jg spark_next
+    mov dx, ax              ; dx = x
+
+    ; random y offset in range -8..+7
+    mov bx, 16
+    call getrandom          ; ax = 0..15
+    sub ax, 8
+    add ax, di              ; ax = y
+
+    ; clamp y to 0..SCR_HEIGHT-1
+    cmp ax, 0
+    jl spark_next
+    cmp ax, SCR_HEIGHT-1
+    jg spark_next
+
+    ; compute video offset: y*320 + x
+    mov bx, SCR_WIDTH
+    mul bx                  ; ax = y*320
+    add ax, dx              ; + x
+    mov di, ax
+
+    ; draw bright yellow pixel (14)
+    mov byte [es:di], 14
+
+spark_next:
+    loop spark_loop
+
+    popa
+    ret
+
+; check if changing into a side lane would crash into a blue car
+; IN:  AL = target lane index (0,1,2)
+; OUT: AL = 1 if crash, 0 if safe
+check_side_lane_collision:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+
+    ; default: no crash
+    mov byte [tmp_side_flag], 0
+    mov [tmp_target_lane], al
+
+    ; red car vertical range
+    mov ax, [redy]
+    mov [tmp_side_top], ax
+    add ax, CARH
+    mov [tmp_side_bottom], ax
+
+    xor si, si
+
+csl_loop:
+    call get_blue_car_ptr
+
+    ; active?
+    mov ax, [bx]
+    cmp ax, 0
+    je csl_next
+
+    ; y valid?
+    mov ax, [bx + 4]
+    cmp ax, 0FFFFh
+    je csl_next
+    cmp ax, SCR_HEIGHT
+    jge csl_next
+
+    ; same lane?
+    mov dl, [bx + 8]
+    mov al, [tmp_target_lane]
+    cmp dl, al
+    jne csl_next
+
+    ; blue vertical range
+    mov dx, [bx + 4]    ; blue top
+    mov bp, dx
+    add bp, CARH        ; blue bottom
+
+    ; check vertical overlap:
+    ; red_bottom > blue_top AND red_top < blue_bottom
+    mov ax, [tmp_side_bottom]
+    cmp ax, dx
+    jle csl_next
+
+    mov ax, [tmp_side_top]
+    cmp bp, ax
+    jle csl_next
+
+    ; overlap in target lane -> crash
+    mov byte [tmp_side_flag], 1
+    jmp csl_done
+
+csl_next:
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb csl_loop
+
+csl_done:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+
+    mov al, [tmp_side_flag]
+    ret
 
 ; check collision between red car and all blue cars
 check_blue_collisions:
@@ -1457,6 +2178,14 @@ cbc_loop:
     mov dx, [red_top]
     cmp bp, dx
     jle cbc_next
+
+    ; collision detected – show sparks
+    call draw_spark
+
+; small pause so spark becomes visible
+    mov cx, 30000        ; adjust if needed
+spark_delay:
+    loop spark_delay
 
     mov word [game_over_flag], 1
     mov byte [end_reason], REASON_CRASH
@@ -1759,10 +2488,11 @@ draw_coin_done:
     ret
 
 
-; draw fuel HUD bar
+; draw fuel HUD bar (bottom bar, color depends on fuel)
 draw_fuel_hud: 
     pusha
 
+    ; bottom "FUEL" label (same as before)
     mov ah, 02h
     xor bh, bh
     mov dh, 22
@@ -1782,112 +2512,200 @@ draw_fuel_hud:
     mov al, 'L'
     int 10h
 
+    ; draw bar based on fuel_value
     mov ax, VIDSEG
     mov es, ax
 
+    ; start at y=184, x=8
     mov bp, 184
-    mov si, 8
     mov ax, bp
     mov bx, SCR_WIDTH
     mul bx
     mov di, ax
-    add di, si 
+    add di, 8
+
+    ; clamp fuel_value to 0..FUEL_MAX
+    mov ax, [fuel_value]
+    cmp ax, 0
+    jge dfh_not_neg
+    xor ax, ax
+dfh_not_neg:
+    cmp ax, FUEL_MAX
+    jle dfh_ok_max
+    mov ax, FUEL_MAX
+dfh_ok_max:
+    mov dx, ax          ; dx = segments filled (0..12)
+
+        ; choose color:
+    ; <4  = red (4)
+    ; <8  = yellow (14)
+    ; else = green (2)
+
+    cmp dx, 4
+    jl dfh_red          ; fuel < 4 → red
+
+    cmp dx, 8
+    jl dfh_yellow       ; fuel < 8 → yellow
+
+    mov bl, 2           ; green
+    jmp dfh_color_done
+
+dfh_red:
+    mov bl, 4
+    jmp dfh_color_done
+
+dfh_yellow:
+    mov bl, 14
+
+dfh_color_done:
+    ; draw 12 segments, each 2x8 pixels, with 2px gap (add di,4)
+    xor si, si          ; si = segment index 0..11
     mov cx, 12
 
-drawfuel_loop:
-    push di 
-    call drawfuelbar
-    add di, 4 
-    loop drawfuel_loop
+dfh_seg_loop:
+    push cx
+    push di
+
+    mov bh, 8           ; 8 rows high
+dfh_row_loop:
+    push di
+    mov cx, 2           ; 2 columns wide
+dfh_col_loop:
+    mov al, 0           ; empty by default
+    cmp si, dx
+    jae dfh_empty_px    ; if segment index >= filled count => empty
+    mov al, bl          ; filled => chosen color
+dfh_empty_px:
+    mov [es:di], al
+    inc di
+    loop dfh_col_loop
+    pop di
+    add di, SCR_WIDTH
+    dec bh
+    jnz dfh_row_loop
+
+    pop di
+    pop cx
+    add di, 4           ; move to next segment slot
+    inc si
+    loop dfh_seg_loop
 
     popa
     ret
 
-
-drawfuelbar:
-    push bp 
-    mov bp, sp 
-    pusha 
-    mov di, [bp+4] 
-
-    mov bx, 8
-fuel_row_loop:
-    push di 
-    mov cx, 2
-fuel_col_loop:
-    mov al, 2
-    mov [es:di], al
-    inc di
-    loop fuel_col_loop
-    pop di 
-    add di, SCR_WIDTH
-    dec bx
-    jnz fuel_row_loop
-
-    popa
-    pop bp
-    ret 2
-
-
+; draw coin HUD
 ; draw coin HUD
 draw_coin_hud:
     pusha
 
+    ; move to top-left
     mov ah, 02h
     xor bh, bh
     mov dh, 0
     mov dl, 0
     int 10h
 
+    ; print "COINS: "
     mov ah, 0Eh
     mov bh, 0
     mov bl, 0Fh
     mov si, msg_coins
-
 coin_label_loop:
     lodsb
     or al, al
     jz coin_label_done
     int 10h
     jmp coin_label_loop
-
 coin_label_done:
-    mov ax, [coin_count]
-    call print_dec
 
+    ; clear old digits area (5 spaces)
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+
+    mov cx, 5
+clear_coin_digits:
+    mov al, ' '
+    int 10h
+    loop clear_coin_digits
+
+        ; move cursor to after label ("COINS: " = 7 chars)
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 0
+    mov dl, 7
+    int 10h
+
+    ; clamp coin_count to 0..999 and print as 3 digits (000–999)
+    mov ax, [coin_count]
+    cmp ax, 0
+    jge dch_not_neg
+    xor ax, ax
+dch_not_neg:
+    cmp ax, 999
+    jle dch_ok_max
+    mov ax, 999
+dch_ok_max:
+    call print_dec3
     popa
     ret
-
 
 ; draw fuel HUD text
 draw_fuel_text:
     pusha
 
+    ; move to row 1, col 0
     mov ah, 02h
     xor bh, bh
     mov dh, 1
     mov dl, 0
     int 10h
 
+    ; print "FUEL: "
     mov ah, 0Eh
     mov bh, 0
     mov bl, 0Fh
     mov si, msg_fuel
-
 fuel_label_loop:
     lodsb
     or al, al
     jz fuel_label_done
     int 10h
     jmp fuel_label_loop
-
 fuel_label_done:
-    mov ax, [fuel_value]
-    call print_dec
 
+    ; clear old digits area (5 spaces)
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+
+    mov cx, 5
+clear_fuel_digits:
+    mov al, ' '
+    int 10h
+    loop clear_fuel_digits
+
+
+        ; move cursor to after "FUEL: " (6 chars)
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 1
+    mov dl, 6
+    int 10h
+
+    ; clamp fuel_value to 0..99 and print as 2 digits (00–99)
+    mov ax, [fuel_value]
+    cmp ax, 0
+    jge dft_not_neg
+    xor ax, ax
+dft_not_neg:
+    cmp ax, 99
+    jle dft_ok_max
+    mov ax, 99
+dft_ok_max:
+    call print_dec2
     popa
     ret
-
 
 ; print decimal number in AX
 print_dec:
@@ -1906,6 +2724,89 @@ print_dec:
     mov byte [si], '0'
     mov cx, 1
     jmp print_dec_print
+; print AX as 3 digits (000–999)
+print_dec3:
+    push ax
+    push bx
+    push cx
+    push dx
+
+    ; AX = value
+    mov bx, 100
+    xor dx, dx
+    div bx              ; DX:AX / 100 → AX = hundreds, DX = remainder
+    mov cx, ax          ; CX = hundreds (0..9)
+
+    ; print hundreds
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov al, cl
+    add al, '0'
+    int 10h
+
+    ; AX = remainder (0..99)
+    mov ax, dx
+    mov bx, 10
+    xor dx, dx
+    div bx              ; AX = tens (0..9), DX = ones (0..9)
+
+    ; print tens
+    mov al, al          ; AX already has tens in low byte
+    add al, '0'
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    int 10h
+
+    ; print ones
+    mov al, dl
+    add al, '0'
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    int 10h
+
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; print AX as 2 digits (00–99)
+print_dec2:
+    push ax
+    push bx
+    push cx
+    push dx
+
+    ; AX = value (0..99)
+    mov bx, 10
+    xor dx, dx
+    div bx              ; AX = tens (0..9), DX = ones (0..9)
+
+    ; print tens
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov al, al
+    add al, '0'
+    int 10h
+
+    ; print ones
+    mov al, dl
+    add al, '0'
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    int 10h
+
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
 
 print_dec_convert:
 print_dec_div_loop:
@@ -2882,7 +3783,19 @@ rfs_next_coin:
     inc si
     cmp si, 3
     jb rfs_coin_loop
-
+    xor si, si
+rfs_fuel_loop:
+    mov bx, si
+    shl bx, 1
+    cmp word [fuel_active + bx], 0
+    je rfs_next_fuel
+    mov ax, [fuel_x + bx]
+    mov dx, [fuel_y + bx]
+    call draw_fuel_tank
+rfs_next_fuel:
+    inc si
+    cmp si, 3
+    jb rfs_fuel_loop
     call draw_all_blue_cars
 
     mov cx, [redx]
@@ -3196,9 +4109,13 @@ CARW     equ _carw
 CARH     equ sprite_bytes / CARW
 CARHALFW equ (CARW/2)
 
+move_cooldown  dw 0   ; movement delay timer
+
 ; include coin sprite 
 %include "coin.inc"
 
+; include fuel tank sprite (fueltank label)
+%include "fueltank.inc"
 
 ; DATA SECTION
 
@@ -3229,10 +4146,27 @@ red_bottom    dw 0
 
 game_over_flag dw 0
 
+; helpers for side-lane collision (lane-change crash)
+tmp_side_top      dw 0
+tmp_side_bottom   dw 0
+tmp_target_lane   db 0
+tmp_side_flag     db 0
+
 coin_active dw 0, 0, 0
 coin_x     dw 0, 0, 0
 coin_y     dw 0, 0, 0
 coin_spawn_timer dw 0
+
+
+fuel_tick:  dw 20   ; counts down, reduces fuel every time it hits 0
+; fuel state
+fuel_base_x      dw 0
+fuel_base_y      dw 0
+
+fuel_active      dw 0, 0, 0
+fuel_x           dw 0, 0, 0
+fuel_y           dw 0, 0, 0
+fuel_spawn_timer dw 0
 
 coin_count   dw 0
 fuel_value   dw 12
