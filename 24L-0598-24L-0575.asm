@@ -1,39 +1,38 @@
-; 24L-598 & 24L-0575 
+;24L-0598 & 24L-0575
 [org 0x0100]
 
-; bit blaze car race game 
+;bit blazer race game
 
 SCR_WIDTH   equ 320
 SCR_HEIGHT  equ 200
 VIDSEG      equ 0A000h
 
-; road layout
 ROADL       equ 60
 ROADR       equ 260
 BORDERW     equ 8
 
-; spacing
 NEARX       equ 40
 NEARY       equ 20
 
-; colors
 COL_ASPHALT    equ 8
 COL_LANEYELLOW equ 14
 COL_BORDER     equ 7
-COL_LIGHTGREEN equ 10
-COL_DARKGREEN  equ 2
 
-; coin size
 COINH       equ 12
 COIN_HALF   equ COINH/2
 
-; animation constants
-SCROLL_SPEED    equ 12             ; even faster road + blue car speed
-COIN_SCROLL     equ SCROLL_SPEED   ; coins match road/car speed
-SPAWN_INTERVAL  equ 25             ; spawn blue car more often
+SCROLL_SPEED       equ 12
+COIN_SCROLL        equ 12
+MIN_SPAWN_DELAY    equ 12
+MAX_SPAWN_DELAY    equ 30
+COIN_RESPAWN_DELAY equ 40
 
+MAX_BLUE_CARS equ 5
+
+
+; Start game
 start:
-    mov ax, 0013h
+    mov ax, 13h
     int 10h
 
     push cs
@@ -41,7 +40,7 @@ start:
     mov ax, VIDSEG
     mov es, ax
 
-    ; lanes
+    ; lane width = (ROADR - ROADL + 1) / 3
     mov ax, ROADR
     sub ax, ROADL
     inc ax
@@ -50,12 +49,14 @@ start:
     xor bh, bh
     mov bl, al
 
+    ; lane1 = ROADL + laneWidth
     mov ax, ROADL
     mov dl, bl
     xor dh, dh
     add ax, dx
     mov [lane1], ax
 
+    ; lane2 = ROADL + 2*laneWidth
     mov ax, ROADL
     mov dl, bl
     xor dh, dh
@@ -63,7 +64,7 @@ start:
     add ax, dx
     mov [lane2], ax
 
-    ; lane centers (3 lanes)
+    ; calculate lane centers
     mov ax, ROADL
     add ax, [lane1]
     shr ax, 1
@@ -79,7 +80,7 @@ start:
     shr ax, 1
     mov [lanec3], ax
 
-    ; safe lane center limits
+    ; safe x min / max for centers
     mov ax, ROADL
     add ax, BORDERW
     add ax, CARHALFW
@@ -90,88 +91,74 @@ start:
     sub ax, CARHALFW
     mov [xmaxc], ax
 
-    ; clamp lane centers
+    ; clamp lanec1
     mov ax, [lanec1]
     cmp ax, [xminc]
-    jae lc1_chk_max
+    jae lane1_min_ok
     mov ax, [xminc]
-lc1_chk_max:
+lane1_min_ok:
     cmp ax, [xmaxc]
-    jbe lc1_ok
+    jbe lane1_max_ok
     mov ax, [xmaxc]
-lc1_ok:
+lane1_max_ok:
     mov [lanec1], ax
 
+    ; clamp lanec2
     mov ax, [lanec2]
     cmp ax, [xminc]
-    jae lc2_chk_max
+    jae lane2_min_ok
     mov ax, [xminc]
-lc2_chk_max:
+lane2_min_ok:
     cmp ax, [xmaxc]
-    jbe lc2_ok
+    jbe lane2_max_ok
     mov ax, [xmaxc]
-lc2_ok:
+lane2_max_ok:
     mov [lanec2], ax
 
+    ; clamp lanec3
     mov ax, [lanec3]
     cmp ax, [xminc]
-    jae lc3_chk_max
+    jae lane3_min_ok
     mov ax, [xminc]
-lc3_chk_max:
+lane3_min_ok:
     cmp ax, [xmaxc]
-    jbe lc3_ok
+    jbe lane3_max_ok
     mov ax, [xmaxc]
-lc3_ok:
+lane3_max_ok:
     mov [lanec3], ax
 
-    ; seed rng with RTC
-    mov al, 00h
-    out 0x70, al
-    jmp seed_delay
-seed_delay:
-    in  al, 0x71
-    mov bl, al
-    
-    mov al, 02h
-    out 0x70, al
-    jmp seed_delay2
-seed_delay2:
-    in  al, 0x71
-    mov bh, al
-    
-    call randstep
-
-    ; center red car between lane1 & lane2
+    ; center red car horizontally between lane1 and lane2
     mov ax, [lane1]
     add ax, [lane2]
     shr ax, 1
 
     cmp ax, CARHALFW
-    ja  start_ok_left
+    ja near red_left_ok
     mov ax, CARHALFW
-start_ok_left:
+red_left_ok:
     cmp ax, SCR_WIDTH - CARHALFW
-    jbe start_ok_right
+    jbe near red_right_ok
     mov ax, SCR_WIDTH - CARHALFW
-start_ok_right:
+red_right_ok:
     sub ax, CARHALFW
-    mov cx, ax
+    mov [redx], ax
 
-    ; y = min(160, SCR_HEIGHT - CARH - 1)
+    ; set red car Y
     mov ax, SCR_HEIGHT
     sub ax, CARH
     dec ax
     cmp ax, 160
-    jae start_use160
+    jae set_redy
     mov dx, ax
-    jmp start_y_set
-start_use160:
+    jmp near set_redy_done
+set_redy:
     mov dx, 160
-start_y_set:
-    mov [redx], cx
+set_redy_done:
     mov [redy], dx
 
-    ; setup blue car columns
+    mov byte [red_lane], 1
+
+    ; column safe range for blue cars
     mov ax, ROADL
     add ax, BORDERW
     mov [colstart], ax
@@ -184,125 +171,556 @@ start_y_set:
     sub si, ax
     mov [colend], si
 
-    ; initialize blue car as inactive
-    mov word [bluey], 0xFFFF
-    mov word [old_bluey], 0xFFFF
-    mov word [spawn_timer], SPAWN_INTERVAL
+    ; initialize blue cars
+    call init_blue_cars
 
-    ; initialize coins (3 coins, one per lane)
-    mov word [coin_active],     0
-    mov word [coin_active + 2], 0
-    mov word [coin_active + 4], 0
-    
-    ; quick starter coins
-    mov ax, [lanec1]
-    mov [coin_x], ax
-    mov word [coin_y], 20
-    mov word [coin_active], 1
-    
+    ; random spawn timer
+    mov bx, MAX_SPAWN_DELAY - MIN_SPAWN_DELAY + 1
+    call getrandom
+    add ax, MIN_SPAWN_DELAY
+    mov [spawn_timer], ax
+
+    ; setup coins initially
+    mov word [coin_active], 0
+    mov word [coin_active+2], 0
+    mov word [coin_active+4], 0
+
     mov ax, [lanec2]
-    mov [coin_x + 2], ax
-    mov word [coin_y + 2], 50
-    mov word [coin_active + 2], 1
-    
-    mov ax, [lanec3]
-    mov [coin_x + 4], ax
-    mov word [coin_y + 4], 80
-    mov word [coin_active + 4], 1
+    mov [coin_x+2], ax
+    mov word [coin_y+2], 40
+    mov word [coin_active+2], 1
+
+    mov word [coin_spawn_timer], COIN_RESPAWN_DELAY
+    mov word [game_over_flag], 0
+    mov word [coin_count], 0
+    mov word [fuel_value], 12
 
     ; hide cursor
     mov ah, 01h
     mov ch, 32
     int 10h
 
-    ; one-time background
+    call show_start_screen
     call draw_background
-    
-    ; red car is static for now
+
+    ; force spawn a blue car at start screen
+    mov si, 0             ; use blue car slot 0
+    call spawn_blue_car   ; create 1 proper blue car
+
+    ; need to draw car for static screen and we need to make sure its visible on the road
+    mov si,0
+    call get_blue_car_ptr      ; BX -> car0 struct
+    mov word [bx + 4], 20      ; y = 20 (visible on road)
+    mov ax, 20
+    add ax, CARH
+    mov [bx + 6], ax           ; bottom = y + height
+
+    xor si, si
+    call get_blue_car_ptr
+    mov cx, [bx+2]
+    mov dx, [bx+4]
+    call draw_car_blue
+
     mov cx, [redx]
     mov dx, [redy]
     call draw_car_red
-    
-    ; fuel HUD
+
     call draw_fuel_hud
+    call draw_coin_hud
+    call draw_fuel_text
+    call show_press_to_start_overlay
 
-; main loop
+
 game_loop:
-    ; wipe old blue car
-    mov ax, [old_bluey]
-    cmp ax, 0xFFFF
-    je skip_erase_blue
-    mov cx, [old_bluex]
-    mov dx, [old_bluey]
-    call erase_car
-    
-skip_erase_blue:
-    ; move blue car
-    call update_blue_car
-    
-    ; coins: erase old, move, collision, respawn, draw
-    call update_coins
-    
-    ; blue car draw
-    mov ax, [bluey]
-    cmp ax, 0xFFFF
-    je skip_draw_blue
-    mov cx, [bluex]
-    mov dx, [bluey]
-    call draw_car_blue
-    
-skip_draw_blue:
-    ; spawn animation bookkeeping (car already full-height)
-    mov al, [blue_spawn_active]
-    cmp al, 0
-    je no_spawn_anim_step
-    mov ax, [blue_visible_rows]
-    add ax, 6
-    cmp ax, CARH
-    jbe store_vis_rows
-    mov ax, CARH
-store_vis_rows:
-    mov [blue_visible_rows], ax
-    cmp ax, CARH
-    jne no_spawn_anim_step
-    mov byte [blue_spawn_active], 0
-no_spawn_anim_step:
 
-    ; remember blue pos
-    mov ax, [bluex]
-    mov [old_bluex], ax
-    mov ax, [bluey]
-    mov [old_bluey], ax
-    
-    ; even faster software delay (smaller loop counts again)
-    mov cx, 250           ; fewer outer loops
+    call erase_all_blue_cars
+    call update_all_blue_cars
+    call update_coins
+    call draw_all_blue_cars
+
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+
+    mov ah, 01h
+    int 16h
+    jz near no_key
+
+    xor ah, ah
+    int 16h
+
+    cmp al, 27
+    je key_escape
+
+    cmp al, 0
+    jne near no_key
+
+    cmp ah, 4Bh
+    je key_move_left
+
+    cmp ah, 4Dh
+    je key_move_right
+	
+    cmp ah, 48h
+    je key_move_up
+
+    cmp ah, 50h
+    je key_move_down
+
+    jmp no_key
+
+key_escape:
+    call confirm_exit
+    cmp al, 1
+    je near exit_to_dos
+    call redraw_full_scene
+    jmp after_keys
+
+key_move_left:
+    mov cx, [redx]
+    mov dx, [redy]
+    call erase_car
+    call move_red_left
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+    jmp after_keys
+
+key_move_right:
+    mov cx, [redx]
+    mov dx, [redy]
+    call erase_car
+    call move_red_right
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+    jmp after_keys
+
+key_move_up:
+    mov cx, [redx]
+    mov dx, [redy]
+    call erase_car
+    call move_red_up
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+    jmp after_keys
+
+key_move_down:
+    mov cx, [redx]
+    mov dx, [redy]
+    call erase_car
+    call move_red_down
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+    jmp after_keys
+
+move_red_up:
+    push ax
+
+    mov ax, [redy]
+    cmp ax, 20          ; top limit
+    jle mru_no_move
+    sub ax, 20          ; move up 20 pixels
+    mov [redy], ax
+
+mru_no_move:
+    pop ax
+    ret
+
+move_red_down:
+    push ax
+
+    mov ax, [redy]
+    add ax, 20          ; move down 20 pixels
+    cmp ax, SCR_HEIGHT - CARH
+    jge mrd_no_move
+    mov [redy], ax
+    jmp mrd_done
+
+mrd_no_move:
+    ; clamp to bottom
+    mov ax, SCR_HEIGHT - CARH
+    mov [redy], ax
+
+mrd_done:
+    pop ax
+    ret
+
+no_key:
+
+after_keys:
+    call check_blue_collisions
+    cmp word [game_over_flag], 0
+    jne game_over_mode
+
+    mov cx, 250
 delay_outer:
-    mov dx, 1000          ; fewer inner loops
+    mov dx, 1000
 delay_inner:
     dec dx
     jnz delay_inner
     loop delay_outer
-    
-    ; ESC to quit
-    mov ah, 01h
-    int 16h
-    jz no_key_pressed
 
-    xor ah, ah
-    int 16h
-    cmp al, 27
-    je exit_to_text
-
-no_key_pressed:
     jmp game_loop
 
-exit_to_text:
-    mov ax, 0003h
+game_over_mode:
+    call game_over_screen
+    mov ah, 0
+    int 16h
+    jmp near exit_to_dos
+
+exit_to_dos:
+    mov ax, 3
     int 10h
     mov ax, 4C00h
     int 21h
+; initialize all blue cars as inactive
+init_blue_cars:
+    push ax
+    push bx
+    push cx
+    push si
+    
+    xor si, si
+init_blue_loop:
+    call get_blue_car_ptr
+    mov word [bx], 0          ; active = 0
+    mov word [bx + 2], 0      ; x
+    mov word [bx + 4], 0FFFFh ; y = offscreen
+    mov word [bx + 6], 0      ; bottom
+    mov byte [bx + 8], 0      ; lane
+    mov word [bx + 10], 0      ; old_x
+    mov word [bx + 12], 0FFFFh ; old_y
+    
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb init_blue_loop
+    
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
 
-; erase a 12x12 coin at center (CX, DX)
+
+; get pointer to blue car structure at index SI
+; returns BX = pointer to structure
+get_blue_car_ptr:
+    push ax
+    mov bx, si
+    mov ax, 14               ; 14 bytes per car
+    mul bx
+    mov bx, blue_cars
+    add bx, ax
+    pop ax
+    ret
+
+
+; erase all active blue cars using old positions
+erase_all_blue_cars:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    
+    xor si, si
+erase_all_loop:
+    call get_blue_car_ptr
+    
+    mov ax, [bx + 12]         ; old_y
+    cmp ax, 0FFFFh
+    je erase_skip
+    cmp ax, SCR_HEIGHT
+    jge erase_skip
+    
+    mov cx, [bx + 10]          ; old_x
+    mov dx, [bx + 12]         ; old_y
+    call erase_car
+    
+erase_skip:
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb erase_all_loop
+    
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; draw all active blue cars
+draw_all_blue_cars:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    
+    xor si, si
+draw_blue_all_loop:
+    call get_blue_car_ptr
+    
+    mov ax, [bx]
+    cmp ax, 0
+    je draw_blue_skip_car
+    
+    mov ax, [bx + 4]          ; y
+    cmp ax, 0FFFFh
+    je draw_blue_skip_car
+    cmp ax, SCR_HEIGHT
+    jge draw_blue_skip_car
+    
+    mov cx, [bx + 2]          ; x
+    mov dx, [bx + 4]          ; y
+    call draw_car_blue
+    
+draw_blue_skip_car:
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb draw_blue_all_loop
+    
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; update all blue cars (movement and spawning)
+update_all_blue_cars:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    
+    xor si, si
+update_blue_all_loop:
+    call get_blue_car_ptr
+    
+    mov ax, [bx]
+    cmp ax, 0
+    je blue_try_spawn
+    
+    ; save old position
+    mov ax, [bx + 2]
+    mov [bx + 10], ax
+    mov ax, [bx + 4]
+    mov [bx + 12], ax
+    
+    ; move car down
+    mov ax, [bx + 4]
+    add ax, SCROLL_SPEED
+    mov [bx + 4], ax
+    
+    ; update bottom
+    mov dx, ax
+    add dx, CARH
+    mov [bx + 6], dx
+    
+    ; deactivate if fully off screen
+    cmp ax, SCR_HEIGHT
+    jl update_blue_next
+    
+    mov word [bx], 0
+    mov word [bx + 4], 0FFFFh
+    jmp near update_blue_next
+    
+blue_try_spawn:
+    ; check spawn timer only once per frame (but allow car spawning regardless of SI)
+	dec word [spawn_timer]
+	jnz update_blue_next
+
+	; reset spawn timer
+	push bx
+	mov bx, MAX_SPAWN_DELAY - MIN_SPAWN_DELAY + 1
+	call getrandom
+	add ax, MIN_SPAWN_DELAY
+	mov [spawn_timer], ax
+	pop bx
+
+	; find first inactive car
+	call find_inactive_car
+	cmp si, 0FFFFh
+	je update_blue_next
+
+	call spawn_blue_car
+
+update_blue_next:
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb update_blue_all_loop
+    
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; find first inactive blue car
+; returns SI index or 0FFFFh if all active
+find_inactive_car:
+    push ax
+    push bx
+    push cx
+    
+    xor si, si
+find_inactive_loop:
+    call get_blue_car_ptr
+    mov ax, [bx]
+    cmp ax, 0
+    je find_inactive_found
+    
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb find_inactive_loop
+    
+    mov si, 0FFFFh
+    jmp find_inactive_done
+    
+find_inactive_found:
+find_inactive_done:
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; spawn a blue car at index SI (array version)
+spawn_blue_car:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+
+    ; get pointer to this car slot (index in SI)
+    call get_blue_car_ptr
+    mov bp, bx              ; save pointer for this car slot in BP
+
+    ; choose random lane 0..2
+    mov bx, 3
+    call getrandom          ; ax = 0..2
+    mov di, ax              ; lane index
+    mov [bp + 8], di        ; store lane in this car slot
+    mov [spawn_lane], di    ; store for overlap checks
+
+    ; convert lane -> lane center
+    cmp di, 0
+    je sbc_lane1
+    cmp di, 1
+    je sbc_lane2
+    mov ax, [lanec3]
+    jmp sbc_lane_ok
+
+sbc_lane2:
+    mov ax, [lanec2]
+    jmp sbc_lane_ok
+
+sbc_lane1:
+    mov ax, [lanec1]
+
+sbc_lane_ok:
+    ; convert center → left side
+    sub ax, CARHALFW
+    mov cx, ax
+
+    ; clamp X so car never goes off-road
+    cmp cx, [colstart]
+    jae sbc_chk_right
+    mov cx, [colstart]
+    jmp sbc_x_ok
+
+sbc_chk_right:
+    cmp cx, [colend]
+    jbe sbc_x_ok
+    mov cx, [colend]
+
+sbc_x_ok:
+
+    ; ANTI-OVERLAP CHECK
+
+   xor di, di
+sbc_overlap_loop:
+    cmp di, MAX_BLUE_CARS
+    je sbc_no_overlap
+
+    mov si, di
+    call get_blue_car_ptr   ; BX = pointer to existing car
+
+    cmp word [bx], 1
+    jne sbc_next
+
+    ; same lane?
+    mov al, [bx + 8]
+    cmp al, [spawn_lane]
+    jne sbc_next
+
+    ; existing_y in range [-CARH .. CARH+20] ?
+    mov ax, [bx + 4]
+
+    ; if existing_y < -CARH → too high, ignore
+    cmp ax, -CARH
+    jl sbc_next
+
+    ; if existing_y > (CARH+20) → far enough, ignore
+    cmp ax, CARH + 20
+    jg sbc_next
+
+    ; otherwise TOO CLOSE, block spawn
+    jmp near sbc_abort_spawn
+
+sbc_next:
+    inc di
+    jmp sbc_overlap_loop
+
+sbc_no_overlap:
+    ; SAFE TO ACTIVATE THIS CAR SLOT
+    mov bx, bp                ; restore pointer to chosen slot
+
+    mov word [bx], 1          ; active = 1
+    mov [bx + 2], cx          ; x position
+    mov ax, -CARH
+    mov [bx + 4], ax          ; y position
+    add ax, CARH
+    mov [bx + 6], ax          ; bottom Y
+
+    jmp near sbc_done
+
+; overlap found -> do not spawn anything this frame
+sbc_abort_spawn:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+sbc_done:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; erase a 12x12 coin at center CX,DX
 erase_coin_at:
     push ax
     push bx
@@ -314,81 +732,110 @@ erase_coin_at:
     
     sub cx, 6
     sub dx, 6
-    
-    mov bp, dx
-    mov si, 12
-    
+    mov [coin_base_x], cx
+    mov [coin_base_y], dx
+
+    xor si, si
+
 erase_coin_row_loop:
-    mov ax, bp
+    mov ax, [coin_base_y]
+    add ax, si
+    mov bp, ax
+
     mov bx, SCR_WIDTH
     mul bx
     mov di, ax
-    add di, cx
-    
-    push cx
+    mov ax, [coin_base_x]
+    add di, ax
+
+    mov bx, [coin_base_x]
     mov cx, 12
-    
+
 erase_coin_col_loop:
-    push di
-    push cx
-    
-    mov ax, di
-    xor dx, dx
-    mov bx, SCR_WIDTH
-    div bx
-    mov bx, dx
-    
+    ; check overlap with red car
+    mov ax, [redx]
+    cmp bx, ax
+    jb erase_not_red
+    mov dx, ax
+    add dx, CARW
+    cmp bx, dx
+    jae erase_not_red
+
+    mov ax, bp
+    cmp ax, [redy]
+    jb erase_not_red
+    mov dx, [redy]
+    add dx, CARH
+    cmp ax, dx
+    jae erase_not_red
+
+    mov ax, bp
+    sub ax, [redy]
+    mov dx, CARW
+    mul dx
+    mov dx, bx
+    sub dx, [redx]
+    add ax, dx
+    push si
+    mov si, car_sprite
+    add si, ax
+    mov al, [si]
+    pop si
+    or  al, al
+    jz erase_not_red
+    jmp erase_write_pixel
+
+erase_not_red:
     cmp bx, ROADL
-    jb erase_coin_grass
+    jb erase_grass
     cmp bx, ROADR
-    ja erase_coin_grass
-    
+    ja erase_grass
+
     mov ax, bx
     sub ax, ROADL
     cmp ax, BORDERW
-    jb erase_coin_border
-    
+    jb erase_border
+
     mov ax, ROADR
     sub ax, bx
     cmp ax, BORDERW
-    jb erase_coin_border
-    
+    jb erase_border
+
     cmp bx, [lane1]
-    je erase_coin_lane
+    je erase_lane
     cmp bx, [lane2]
-    je erase_coin_lane
-    
+    je erase_lane
+
     mov al, COL_ASPHALT
-    jmp erase_coin_write
-    
-erase_coin_border:
+    jmp erase_write_pixel
+
+erase_border:
     mov al, COL_BORDER
-    jmp erase_coin_write
-    
-erase_coin_lane:
+    jmp erase_write_pixel
+
+erase_lane:
     test bp, 3
-    jnz erase_coin_asphalt
+    jnz erase_lane_asphalt
     mov al, COL_LANEYELLOW
-    jmp erase_coin_write
-    
-erase_coin_asphalt:
+    jmp erase_write_pixel
+
+erase_lane_asphalt:
     mov al, COL_ASPHALT
-    jmp erase_coin_write
-    
-erase_coin_grass:
+    jmp erase_write_pixel
+
+erase_grass:
     mov al, 0
-    
-erase_coin_write:
-    pop cx
-    pop di
+
+erase_write_pixel:
     mov [es:di], al
     inc di
-    loop erase_coin_col_loop
-    
-    pop cx
-    inc bp
-    dec si
-    jnz erase_coin_row_loop
+    inc bx
+    dec cx
+    jnz erase_coin_col_loop
+
+    inc si
+    cmp si, 12
+    jb erase_coin_row_loop
     
     pop bp
     pop di
@@ -399,7 +846,8 @@ erase_coin_write:
     pop ax
     ret
 
-; coins: erase old, move, collision, respawn, draw
+
+; coins: erase, move, collision, respawn, draw
 update_coins:
     push ax
     push bx
@@ -407,17 +855,26 @@ update_coins:
     push dx
     push si
     push di
-    
+
+    cmp word [coin_spawn_timer], 0
+    jle coin_do_spawn
+    dec word [coin_spawn_timer]
+    jmp coin_after_spawn
+
+coin_do_spawn:
+    call spawn_coin_once
+    mov word [coin_spawn_timer], COIN_RESPAWN_DELAY
+
+coin_after_spawn:
     xor si, si
-    
-coin_update_loop:
+
+coin_loop:
     mov bx, si
     shl bx, 1
 
-    ; if active, erase old coin
     mov ax, [coin_active + bx]
     cmp ax, 0
-    je skip_erase_this_coin
+    je coin_next
 
     mov ax, [coin_x + bx]
     mov cx, ax
@@ -425,53 +882,48 @@ coin_update_loop:
     mov dx, ax
     call erase_coin_at
 
-skip_erase_this_coin:
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    je coin_maybe_spawn
-
-    ; move coin down at same speed as road/car
     mov ax, [coin_y + bx]
     add ax, COIN_SCROLL
     mov [coin_y + bx], ax
-    
-    ; past bottom? kill
+
     cmp ax, SCR_HEIGHT
     jae coin_deactivate
-    
-    ; collision?
+
     mov ax, [coin_x + bx]
     mov cx, ax
     mov dx, [coin_y + bx]
     call check_coin_collision
     cmp al, 1
-    je coin_deactivate
-    
-    jmp coin_draw
+    jne coin_no_hit
+
+    mov ax, [coin_x + bx]
+    mov cx, ax
+    mov dx, [coin_y + bx]
+    call erase_coin_at
+
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+
+    inc word [coin_count]
+    call draw_coin_hud
+    jmp coin_deactivate
+
+coin_no_hit:
+    mov ax, [coin_x + bx]
+    mov dx, [coin_y + bx]
+    call draw_coin_circle
+    jmp coin_after_coin
 
 coin_deactivate:
     mov word [coin_active + bx], 0
 
-coin_maybe_spawn:
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    jne coin_draw
-    call spawn_coin_lane
-
-coin_draw:
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    je coin_done_one
-
-    mov ax, [coin_x + bx]
-    mov dx, [coin_y + bx]
-    call draw_coin_circle
-
-coin_done_one:
+coin_after_coin:
+coin_next:
     inc si
     cmp si, 3
-    jb coin_update_loop
-    
+    jb coin_loop
+
     pop di
     pop si
     pop dx
@@ -480,106 +932,154 @@ coin_done_one:
     pop ax
     ret
 
-; spawn coin in lane SI
-spawn_coin_lane:
+
+; choose a random inactive lane and spawn one coin
+spawn_coin_once:
     push ax
     push bx
     push cx
     push dx
-    
+    push si
+
+    mov si, 0
+    mov cx, 3
+
+spawn_coin_check_inactive:
     mov bx, si
     shl bx, 1
-    
-    cmp si, 0
-    je set_lane0_x
-    cmp si, 1
-    je set_lane1_x
-    mov ax, [lanec3]
-    jmp store_coin_x
-    
-set_lane1_x:
-    mov ax, [lanec2]
-    jmp store_coin_x
-    
-set_lane0_x:
-    mov ax, [lanec1]
-    
-store_coin_x:
-    mov [coin_x + bx], ax
-    
-    ; if blue not active, just random near top
-    mov ax, [bluey]
-    cmp ax, 0xFFFF
-    je spawn_random_y
+    mov ax, [coin_active + bx]
+    cmp ax, 0
+    je spawn_coin_found_inactive
+    inc si
+    loop spawn_coin_check_inactive
 
-    ; only tie to blue when same lane
-    mov al, [blue_lane]
+    jmp near spawn_coin_done
 
-    cmp si, 0
-    je lane0_check
-    cmp si, 1
-    je lane1_check
-    cmp al, 2
-    jne spawn_random_y
-    jmp spawn_behind_blue
+spawn_coin_found_inactive:
+    mov cx, 3
 
-lane1_check:
-    cmp al, 1
-    jne spawn_random_y
-    jmp spawn_behind_blue
+spawn_coin_try_lane:
+    mov bx, 3
+    call getrandom       ; ax = 0..2
+    mov si, ax
 
-lane0_check:
-    cmp al, 0
-    jne spawn_random_y
+    mov bx, si
+    shl bx, 1
+    mov ax, [coin_active + bx]
+    cmp ax, 0
+    je spawn_coin_do
+    loop spawn_coin_try_lane
+    jmp near spawn_coin_done
 
-spawn_behind_blue:
-    ; drop coin a bit behind blue car, but not too low
-    mov ax, [blue_bottom]
-    add ax, 32
+spawn_coin_do:
+    call spawn_coin_lane
 
-    cmp ax, SCR_HEIGHT - 40
-    jbe spawn_y_ok_candidate
-
-    ; if too low, spawn like normal random top
-    push bx
-    push si
-    mov bx, 50
-    call getrandom
-    add ax, 10
+spawn_coin_done:
     pop si
-    pop bx
-    jmp spawn_y_ok_store
-
-spawn_y_ok_candidate:
-    cmp ax, SCR_HEIGHT - COIN_HALF
-    jbe spawn_y_ok_store
-    mov ax, SCR_HEIGHT - COIN_HALF
-
-spawn_y_ok_store:
-    mov [coin_y + bx], ax
-    jmp activate_coin_now
-    
-spawn_random_y:
-    push bx
-    push si
-    mov bx, 50
-    call getrandom
-    add ax, 10
-    pop si
-    pop bx
-    mov [coin_y + bx], ax
-    
-activate_coin_now:
-    mov word [coin_active + bx], 1
-    
     pop dx
     pop cx
     pop bx
     pop ax
     ret
 
-; check if coin (CX, DX) hits red car
-; AL = 1 if hit, 0 if not
+
+; spawn coin in lane SI, avoid overlap with blue cars if possible
+spawn_coin_lane:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+
+    mov bx, si
+    shl bx, 1
+
+    cmp si, 0
+    je spawn_coin_lane0
+    cmp si, 1
+    je spawn_coin_lane1
+    mov ax, [lanec3]
+    jmp spawn_coin_store_x
+
+spawn_coin_lane1:
+    mov ax, [lanec2]
+    jmp spawn_coin_store_x
+
+spawn_coin_lane0:
+    mov ax, [lanec1]
+
+spawn_coin_store_x:
+    mov [coin_x + bx], ax
+
+    ; try to position relative to any blue car in this lane
+    push si
+    xor di, di
+spawn_coin_check_blue:
+    push bx
+    mov si, di
+    call get_blue_car_ptr
+
+    mov ax, [bx]
+    cmp ax, 0
+    je spawn_coin_next_blue
+
+    mov al, [bx + 8]
+    pop bx
+    push bx
+    cmp al, [si]         ; compare lane index
+    jne spawn_coin_next_blue
+
+    mov ax, [bx + 6]     ; bottom of blue car
+    add ax, 32
+
+    cmp ax, SCR_HEIGHT - 40
+    jbe spawn_coin_candidate
+
+    push bx
+    mov bx, 50
+    call getrandom
+    add ax, 10
+    pop bx
+    jmp spawn_coin_store_y
+
+spawn_coin_candidate:
+    cmp ax, SCR_HEIGHT - COIN_HALF
+    jbe spawn_coin_store_y
+    mov ax, SCR_HEIGHT - COIN_HALF
+
+spawn_coin_store_y:
+    pop bx
+    pop si
+    mov [coin_y + bx], ax
+    jmp spawn_coin_activate
+
+spawn_coin_next_blue:
+    pop bx
+    inc di
+    cmp di, MAX_BLUE_CARS
+    jb spawn_coin_check_blue
+
+    pop si
+
+    push bx
+    mov bx, 50
+    call getrandom
+    add ax, 10
+    pop bx
+    mov [coin_y + bx], ax
+
+spawn_coin_activate:
+    mov word [coin_active + bx], 1
+
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; check if coin at CX,DX collides with red car
 check_coin_collision:
     push bx
     push cx
@@ -608,31 +1108,31 @@ check_coin_collision:
     add dx, 12
     
     cmp ax, si
-    jl no_collision_clean
+    jl coin_no_collision_clean
     
     cmp cx, di
-    jg no_collision_clean
+    jg coin_no_collision_clean
     
     cmp dx, bp
-    jl no_collision_clean
+    jl coin_no_collision_clean
     
     pop ax
     cmp ax, bx
-    jg no_collision_pop
+    jg coin_no_collision_pop
     
     pop dx
     pop cx
     mov al, 1
-    jmp collision_done
+    jmp coin_collision_done
     
-no_collision_clean:
+coin_no_collision_clean:
     pop ax
-no_collision_pop:
+coin_no_collision_pop:
     pop dx
     pop cx
     mov al, 0
     
-collision_done:
+coin_collision_done:
     pop bp
     pop di
     pop si
@@ -641,50 +1141,8 @@ collision_done:
     pop bx
     ret
 
-; draw active coins only (spare)
-draw_active_coins:
-    push ax
-    push bx
-    push cx
-    push dx
-    push si
-    
-    xor si, si
-    
-draw_coin_loop_active:
-    mov bx, si
-    shl bx, 1
-    
-    mov ax, [coin_active + bx]
-    mov [old_coin_active + bx], ax
-    
-    mov ax, [coin_x + bx]
-    mov [old_coin_x + bx], ax
-    
-    mov ax, [coin_y + bx]
-    mov [old_coin_y + bx], ax
-    
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    je skip_this_coin
-    
-    mov ax, [coin_x + bx]
-    mov dx, [coin_y + bx]
-    call draw_coin_circle
-    
-skip_this_coin:
-    inc si
-    cmp si, 3
-    jb draw_coin_loop_active
-    
-    pop si
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
 
-; erase car by restoring background colors
+; erase any car (red or blue) at CX,DX using road background
 erase_car:
     push ax
     push bx
@@ -694,84 +1152,120 @@ erase_car:
     push di
     push bp
 
+    mov ax, dx
+    cmp ax, SCR_HEIGHT
+    jl erase_car_check_top
+    jmp erase_car_done
+
+erase_car_check_top:
+    mov ax, dx
+    add ax, CARH
+    cmp ax, 0
+    jg erase_car_compute
+    jmp erase_car_done
+
+erase_car_compute:
     mov bp, dx
-    mov si, CARH
-    
-erase_row_loop:
+    cmp bp, 0
+    jge erase_car_y_start_ok
+    xor bp, bp
+erase_car_y_start_ok:
+    mov ax, dx
+    add ax, CARH
+    cmp ax, SCR_HEIGHT
+    jle erase_car_y_end_ok
+    mov ax, SCR_HEIGHT
+erase_car_y_end_ok:
+    sub ax, bp
+    mov si, ax
+
     mov ax, bp
     mov bx, SCR_WIDTH
     mul bx
     mov di, ax
     add di, cx
-    
+
+erase_car_row_loop:
+    cmp si, 0
+    jle erase_car_done
+
     push cx
-    mov cx, CARW
+    push dx
     push si
-    mov si, cx
-    
-erase_col_loop:
+
+    mov cx, CARW
+
+erase_car_col_loop:
     push di
     push cx
-    
+
     mov ax, di
     xor dx, dx
     mov bx, SCR_WIDTH
     div bx
     mov bx, dx
-    
+
     cmp bx, ROADL
-    jb erase_grass
+    jb erase_car_grass
     cmp bx, ROADR
-    ja erase_grass
-    
+    ja erase_car_grass
+
     mov ax, bx
     sub ax, ROADL
     cmp ax, BORDERW
-    jb erase_border
-    
+    jb erase_car_border
+
     mov ax, ROADR
     sub ax, bx
     cmp ax, BORDERW
-    jb erase_border
-    
+    jb erase_car_border
+
     cmp bx, [lane1]
-    je erase_lane_mark
+    je erase_car_lane
     cmp bx, [lane2]
-    je erase_lane_mark
-    
+    je erase_car_lane
+
     mov al, COL_ASPHALT
-    jmp erase_write
-    
-erase_border:
+    jmp erase_car_write
+
+erase_car_border:
     mov al, COL_BORDER
-    jmp erase_write
-    
-erase_lane_mark:
+    jmp erase_car_write
+
+erase_car_lane:
     test bp, 3
-    jnz erase_asphalt_lane
+    jnz erase_car_lane_asphalt
     mov al, COL_LANEYELLOW
-    jmp erase_write
-    
-erase_asphalt_lane:
+    jmp erase_car_write
+
+erase_car_lane_asphalt:
     mov al, COL_ASPHALT
-    jmp erase_write
-    
-erase_grass:
+    jmp erase_car_write
+
+erase_car_grass:
     mov al, 0
-    
-erase_write:
+
+erase_car_write:
     pop cx
     pop di
     mov [es:di], al
     inc di
-    loop erase_col_loop
-    
+    loop erase_car_col_loop
+
     pop si
+    pop dx
     pop cx
+
     inc bp
     dec si
-    jnz erase_row_loop
-    
+    jz erase_car_done
+
+    mov ax, SCR_WIDTH
+    sub ax, CARW
+    add di, ax
+    jmp erase_car_row_loop
+
+erase_car_done:
     pop bp
     pop di
     pop si
@@ -781,153 +1275,188 @@ erase_write:
     pop ax
     ret
 
-; move blue car and handle spawn timer
-update_blue_car:
+
+; move red car left between lanes
+move_red_left:
     push ax
-    push bx
-    push cx
-    push dx
-    push si
-    
-    mov ax, [bluey]
-    cmp ax, 0xFFFF
-    je check_spawn
-    
-    add ax, SCROLL_SPEED
-    mov [bluey], ax
-    
-    add ax, CARH
-    mov [blue_bottom], ax
-    
-    mov dx, [bluey]
-    cmp dx, SCR_HEIGHT
-    jae deactivate_blue
-    jmp update_done
-    
-deactivate_blue:
-    mov word [bluey], 0xFFFF
-    mov byte [blue_spawn_active], 0
-    jmp check_spawn
-    
-check_spawn:
-    dec word [spawn_timer]
-    jnz update_done
-    
-    mov al, 00h
-    out 0x70, al
-    nop
-    in  al, 0x71
-    and al, 0x0F
-    add al, SPAWN_INTERVAL
+
+    mov al, [red_lane]
+    cmp al, 0
+    jbe move_red_left_no_dec
+    dec al
+    mov [red_lane], al
+move_red_left_no_dec:
     xor ah, ah
-    mov [spawn_timer], ax
-    
-    call spawn_blue_car
-    
-update_done:
-    pop si
-    pop dx
-    pop cx
-    pop bx
+
+    cmp ax, 0
+    je move_red_left_lane1
+    cmp ax, 1
+    je move_red_left_lane2
+    mov ax, [lanec3]
+    jmp move_red_left_store
+
+move_red_left_lane2:
+    mov ax, [lanec2]
+    jmp move_red_left_store
+
+move_red_left_lane1:
+    mov ax, [lanec1]
+
+move_red_left_store:
+    sub ax, CARHALFW
+    mov [redx], ax
+
     pop ax
     ret
 
-; spawn a new blue car at top of lane, fully visible instantly
-spawn_blue_car:
+
+; move red car right between lanes
+move_red_right:
+    push ax
+
+    mov al, [red_lane]
+    cmp al, 2
+    jae move_red_right_no_inc
+    inc al
+    mov [red_lane], al
+move_red_right_no_inc:
+    xor ah, ah
+
+    cmp ax, 0
+    je move_red_right_lane1
+    cmp ax, 1
+    je move_red_right_lane2
+    mov ax, [lanec3]
+    jmp move_red_right_store
+
+move_red_right_lane2:
+    mov ax, [lanec2]
+    jmp move_red_right_store
+
+move_red_right_lane1:
+    mov ax, [lanec1]
+
+move_red_right_store:
+    sub ax, CARHALFW
+    mov [redx], ax
+
+    pop ax
+    ret
+
+
+; check collision between red car and all blue cars
+check_blue_collisions:
     push ax
     push bx
     push cx
     push dx
     push si
     push di
-    
-    mov bx, 3
-    call getrandom
-    mov si, ax
-    mov di, 3
-    
-spawn_pick_lane:
-    cmp si, 0
-    je spawn_use_c1
-    cmp si, 1
-    je spawn_use_c2
-    mov ax, [lanec3]
-    jmp spawn_have_center
-    
-spawn_use_c2:
-    mov ax, [lanec2]
-    add ax, 6
-    jmp spawn_have_center
-    
-spawn_use_c1:
-    mov ax, [lanec1]
-    
-spawn_have_center:
-    sub ax, CARHALFW
-    mov cx, ax
+    push bp
 
-    cmp ax, [colstart]
-    jae spawn_chk_right
-    mov cx, [colstart]
-    jmp spawn_x_ready
-    
-spawn_chk_right:
-    cmp ax, [colend]
-    jbe spawn_x_ready
-    mov cx, [colend]
-    
-spawn_x_ready:
-    mov ax, cx
+    mov word [game_over_flag], 0
+
+    mov ax, [redx]
     add ax, CARHALFW
-    mov dx, [redx]
-    add dx, CARHALFW
-    sub ax, dx
-    jns spawn_abs_ok
+    mov bx, ax
+
+    mov ax, bx
+    sub ax, [lanec1]
+    jns cbc_abs1
     neg ax
-    
-spawn_abs_ok:
-    cmp ax, NEARX
-    jae spawn_x_far
-    dec di
-    jz spawn_force
-    inc si
-    cmp si, 3
-    jb spawn_pick_lane
+cbc_abs1:
+    mov dx, ax
+    mov byte [red_lane], 0
+
+    mov ax, bx
+    sub ax, [lanec2]
+    jns cbc_abs2
+    neg ax
+cbc_abs2:
+    cmp ax, dx
+    jge cbc_check3
+    mov dx, ax
+    mov byte [red_lane], 1
+
+cbc_check3:
+    mov ax, bx
+    sub ax, [lanec3]
+    jns cbc_abs3
+    neg ax
+cbc_abs3:
+    cmp ax, dx
+    jge cbc_lane_done
+    mov byte [red_lane], 2
+
+cbc_lane_done:
+
+    mov ax, [redx]
+    mov [red_left], ax
+    add ax, CARW
+    mov [red_right], ax
+    mov ax, [redy]
+    mov [red_top], ax
+    add ax, CARH
+    mov [red_bottom], ax
+
+    mov al, [red_lane]
+
     xor si, si
-    jmp spawn_pick_lane
-    
-spawn_force:
-spawn_x_far:
-    ; spawn at very top of lane, y=0
-    mov [blue_lane], si
-    mov dx, 0
-    mov [bluey], dx
-    mov [bluex], cx
+cbc_loop:
+    call get_blue_car_ptr
+
+    mov dx, [bx]
+    cmp dx, 0
+    je cbc_next
+
+    mov dx, [bx + 4]
+    cmp dx, 0FFFFh
+    je cbc_next
+    cmp dx, SCR_HEIGHT
+    jge cbc_next
+
+    cmp al, [bx + 8]
+    jne cbc_next
+
+    mov cx, [bx + 2]
+    mov di, cx
+    add di, CARW
+    mov dx, [bx + 4]
+    push ax
     mov ax, dx
     add ax, CARH
-    mov [blue_bottom], ax
+    mov bp, ax
+    pop ax
 
-    ; show full car instantly (no slow reveal)
-    mov byte [blue_spawn_active], 1
-    mov word [blue_visible_rows], CARH
+    mov dx, [red_right]
+    cmp dx, cx
+    jle cbc_next
 
-    ; kill + erase coin in same lane so car doesn't appear on top of it
-    xor ah, ah
-    mov al, [blue_lane]
-    mov bx, ax
-    shl bx, 1
+    mov dx, [red_left]
+    cmp di, dx
+    jle cbc_next
 
-    mov ax, [coin_active + bx]
-    cmp ax, 0
-    je no_lane_coin_to_erase
+    mov dx, [red_bottom]
+    push ax
+    mov ax, [bx + 4]
+    cmp dx, ax
+    pop ax
+    jle cbc_next
 
-    mov cx, [coin_x + bx]
-    mov dx, [coin_y + bx]
-    call erase_coin_at
+    mov dx, [red_top]
+    cmp bp, dx
+    jle cbc_next
 
-no_lane_coin_to_erase:
-    mov word [coin_active + bx], 0
+    mov word [game_over_flag], 1
+    jmp cbc_done
 
+cbc_next:
+    inc si
+    cmp si, MAX_BLUE_CARS
+    jb cbc_loop
+
+cbc_done:
+    pop bp
     pop di
     pop si
     pop dx
@@ -936,7 +1465,8 @@ no_lane_coin_to_erase:
     pop ax
     ret
 
-; background drawing (one time)
+
+; draw road and background
 draw_background:
     push ax
     push bx
@@ -957,19 +1487,19 @@ bg_row_loop:
 bg_col_loop:
     mov ax, si
     cmp ax, ROADL
-    jb bg_outside_grass
+    jb bg_outside_road
     cmp ax, ROADR
-    ja bg_outside_grass
+    ja bg_outside_road
 
     mov ax, si
     sub ax, ROADL
     cmp ax, BORDERW
-    jb bg_paint_border
+    jb bg_border
 
     mov ax, ROADR
     sub ax, si
     cmp ax, BORDERW
-    jb bg_paint_border
+    jb bg_border
 
     mov al, COL_ASPHALT
 
@@ -979,20 +1509,20 @@ bg_col_loop:
     cmp dx, [lane2]
     je bg_maybe_dash
     jmp bg_write_pixel
-    
-bg_paint_border:
+        
+bg_border:
     mov al, COL_BORDER
     jmp bg_write_pixel
-    
+        
 bg_maybe_dash:
     test bp, 3
     jnz bg_write_pixel
     mov al, COL_LANEYELLOW
     jmp bg_write_pixel
-    
-bg_outside_grass:
+        
+bg_outside_road:
     mov al, 0
-    
+        
 bg_write_pixel:
     mov [es:di], al
     inc di
@@ -1014,7 +1544,8 @@ bg_done:
     pop ax
     ret
 
-; draw red car
+
+; draw red car at (CX,DX)
 draw_car_red:
     push ax
     push bx
@@ -1039,7 +1570,7 @@ draw_red_row:
     
 draw_red_col:
     lodsb
-    or al, al
+    cmp al, -1
     jz draw_red_skip
     mov [es:di], al
     
@@ -1059,7 +1590,8 @@ draw_red_skip:
     pop ax
     ret
 
-; draw blue car with clipping and back-to-front spawn logic
+
+; draw blue car with clipping at (CX,DX)
 draw_car_blue:
     push ax
     push bx
@@ -1069,43 +1601,53 @@ draw_car_blue:
     push di
     push bp
 
-    mov bp, CARH
-
-    mov al, [blue_spawn_active]
-    cmp al, 0
-    je skip_spawn_h_override
-    mov bp, [blue_visible_rows]
-skip_spawn_h_override:
-
-    mov ax, dx
-    add ax, bp
-    cmp ax, SCR_HEIGHT
-    jbe blue_all_visible
+    mov bp, dx
+    add bp, CARH
     
-    mov ax, SCR_HEIGHT
+    mov si, 0
+    cmp dx, 0
+    jge blue_start_ok
+    
+    neg dx
+    mov si, dx
+    mov dx, 0
+    
+blue_start_ok:
+    mov ax, bp
     sub ax, dx
+    cmp ax, CARH
+    jbe blue_height_ok
+    mov ax, CARH
+blue_height_ok:
     cmp ax, 0
     jle blue_draw_done
+    
+    cmp dx, SCR_HEIGHT
+    jge blue_draw_done
+    
+    mov bx, dx
+    add bx, ax
+    cmp bx, SCR_HEIGHT
+    jbe blue_no_bottom_clip
+    mov ax, SCR_HEIGHT
+    sub ax, dx
+    
+blue_no_bottom_clip:
     mov bp, ax
-
-blue_all_visible:
+    
     mov ax, dx
+    push dx
     mov bx, SCR_WIDTH
     mul bx
     mov di, ax
     add di, cx
+    pop dx
 
-    mov si, car_blue_sprite
-
-    mov al, [blue_spawn_active]
-    cmp al, 0
-    je no_spawn_row_offset
-    mov ax, CARH
-    sub ax, bp
+    mov ax, si
     mov bx, CARW
     mul bx
+    mov si, car_blue_sprite
     add si, ax
-no_spawn_row_offset:
 
     mov cx, bp
     
@@ -1116,25 +1658,25 @@ draw_blue_row:
     
 draw_blue_col:
     lodsb
-    or  al, al
+    cmp al, -1
     jz  draw_blue_skip
     cmp al, 12
     jne chk_blue_red
     mov al, 9
-    jmp recolor_store
-    
+    jmp blue_store
+
 chk_blue_red:
     cmp al, 4
     jne chk_blue_dark
     mov al, 1
-    jmp recolor_store
-    
+    jmp blue_store
+
 chk_blue_dark:
     cmp al, 3
-    jne recolor_store
+    jne blue_store
     mov al, 1
     
-recolor_store:
+blue_store:
     mov [es:di], al
     
 draw_blue_skip:
@@ -1155,7 +1697,8 @@ blue_draw_done:
     pop ax
     ret
 
-; coin circle
+
+; draw 12x12 coin circle centered at AX,DX
 draw_coin_circle:
     mov [coin_base_x], ax
     mov [coin_base_y], dx
@@ -1201,33 +1744,6 @@ coin_skip_px:
     cmp si, 12
     jb coin_row_loop
 
-    ; tiny shadow
-    mov ax, [coin_base_y]
-    add ax, 8
-    mov cx, SCR_WIDTH
-    mul cx
-    mov di, ax
-    mov ax, [coin_base_x]
-    add di, ax
-    add di, 8
-
-    mov cx, 3
-    
-shadow_row_loop:
-    push cx
-    mov cx, 3
-    
-shadow_col_loop:
-    mov al, 0
-    mov [es:di], al
-    inc di
-    loop shadow_col_loop
-    add di, SCR_WIDTH
-    sub di, 3
-    pop cx
-    dec cx
-    jnz shadow_row_loop
-
     pop di
     pop si
     pop dx
@@ -1236,24 +1752,20 @@ shadow_col_loop:
     pop ax
     ret
 
-; fuel HUD
-draw_fuel_hud:
-    push ax
-    push bx
-    push cx
-    push dx
-    push si
-    push di
+
+; draw fuel bar graphics at bottom
+draw_fuel_hud: 
+    pusha
 
     mov ah, 02h
     xor bh, bh
     mov dh, 22
-    mov dl, 1
+    mov dl, 2
     int 10h
 
     mov ah, 0Eh
     mov bh, 0
-    mov bl, 0Eh
+    mov bl, 0Ah
 
     mov al, 'F'
     int 10h
@@ -1268,29 +1780,415 @@ draw_fuel_hud:
     mov es, ax
 
     mov bp, 184
-    mov si, 10
+    mov si, 8
     mov ax, bp
     mov bx, SCR_WIDTH
     mul bx
-    add ax, si
     mov di, ax
+    add di, si 
+    mov cx, 12
 
-    mov bx, 6
-    
+drawfuel:
+    push di 
+    call drawfuelbar
+    add di, 4 
+    loop drawfuel
+
+    popa
+    ret
+
+
+drawfuelbar:
+    push bp 
+    mov bp, sp 
+    pusha 
+    mov di, [bp+4] 
+
+    mov bx, 8
 fuel_row_loop:
-    push bx
-    mov cx, 40
-    
+    push di 
+    mov cx, 2
 fuel_col_loop:
-    mov al, 12
+    mov al, 2
     mov [es:di], al
     inc di
     loop fuel_col_loop
+    pop di 
     add di, SCR_WIDTH
-    sub di, 40
-    pop bx
     dec bx
     jnz fuel_row_loop
+
+    popa
+    pop bp
+    ret 2
+
+
+; print coin HUD text and value
+draw_coin_hud:
+    pusha
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 0
+    mov dl, 0
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_coins
+draw_coin_label:
+    lodsb
+    or al, al
+    jz draw_coin_label_done
+    int 10h
+    jmp draw_coin_label
+draw_coin_label_done:
+
+    mov ax, [coin_count]
+    call print_dec
+
+    popa
+    ret
+
+
+; print fuel HUD text and value
+draw_fuel_text:
+    pusha
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 1
+    mov dl, 0
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_fuel
+draw_fuel_label:
+    lodsb
+    or al, al
+    jz draw_fuel_label_done
+    int 10h
+    jmp draw_fuel_label
+draw_fuel_label_done:
+
+    mov ax, [fuel_value]
+    call print_dec
+
+    popa
+    ret
+
+
+; print AX as unsigned decimal
+print_dec:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov si, digit_buf + 4
+    mov bx, 10
+    xor cx, cx
+
+    cmp ax, 0
+    jne print_dec_conv
+    mov byte [si], '0'
+    mov cx, 1
+    jmp print_dec_print
+
+print_dec_conv:
+print_dec_div_loop:
+    xor dx, dx
+    div bx
+    add dl, '0'
+    mov [si], dl
+    dec si
+    inc cx
+    cmp ax, 0
+    jne print_dec_div_loop
+
+print_dec_print:
+    inc si
+print_dec_print_loop:
+    mov al, [si]
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    int 10h
+    inc si
+    loop print_dec_print_loop
+
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+
+; start menu screen
+show_start_screen:
+    pusha
+
+    mov ax, VIDSEG
+    mov es, ax
+    xor di, di
+    mov al, 0
+    mov cx, SCR_WIDTH*SCR_HEIGHT
+    rep stosb
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 8
+    mov dl, 8
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Eh
+    mov si, msg_title
+show_title:
+    lodsb
+    or al, al
+    jz show_title_done
+    int 10h
+    jmp show_title
+show_title_done:
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 12
+    mov dl, 8
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_menu_play
+show_play:
+    lodsb
+    or al, al
+    jz show_play_done
+    int 10h
+    jmp show_play
+show_play_done:
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 14
+    mov dl, 8
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_menu_exit
+show_exit:
+    lodsb
+    or al, al
+    jz show_exit_done
+    int 10h
+    jmp show_exit
+show_exit_done:
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 22
+    mov dl, 8
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_credit1
+show_credit1:
+    lodsb
+    or al, al
+    jz show_credit1_done
+    int 10h
+    jmp show_credit1
+show_credit1_done:
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 23
+    mov dl, 8
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_credit2
+show_credit2:
+    lodsb
+    or al, al
+    jz show_credit2_done
+    int 10h
+    jmp show_credit2
+show_credit2_done:
+
+show_menu_wait:
+    mov ah, 0
+    int 16h
+    cmp al, 'p'
+    je show_menu_play_choice
+    cmp al, 'P'
+    je show_menu_play_choice
+    cmp al, 'e'
+    je show_menu_exit_choice
+    cmp al, 'E'
+    je show_menu_exit_choice
+    jmp show_menu_wait
+
+show_menu_play_choice:
+    popa
+    ret
+
+show_menu_exit_choice:
+    popa
+    jmp near exit_to_dos
+
+
+; overlay "Press S to start"
+show_press_to_start_overlay:
+    pusha
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 21
+    mov dl, 22
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_start_prompt
+sps_print:
+    lodsb
+    or al, al
+    jz sps_print_done
+    int 10h
+    jmp sps_print
+sps_print_done:
+
+sps_wait:
+    mov ah, 0
+    int 16h
+    cmp al, 's'
+    je sps_accept
+    cmp al, 'S'
+    je sps_accept
+    jmp sps_wait
+
+sps_accept:
+    call redraw_full_scene
+    popa
+    ret
+
+
+; confirm exit on ESC, returns AL=1 yes, AL=0 no
+confirm_exit:
+    pusha
+
+    mov ax, VIDSEG
+    mov es, ax
+
+    mov bx, 70
+ce_row:
+    mov ax, bx
+    mov cx, SCR_WIDTH
+    mul cx
+    add ax, 80
+    mov di, ax
+    mov cx, 160
+    mov al, 1
+    rep stosb
+
+    inc bx
+    cmp bx, 130
+    jbe ce_row
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 12
+    mov dl, 11
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_confirm_exit
+ce_print:
+    lodsb
+    or al, al
+    jz ce_print_done
+    int 10h
+    jmp ce_print
+ce_print_done:
+
+ce_wait_key:
+    mov ah, 0
+    int 16h
+    cmp al, 'y'
+    je ce_yes
+    cmp al, 'Y'
+    je ce_yes
+    cmp al, 'n'
+    je ce_no
+    cmp al, 'N'
+    je ce_no
+    jmp ce_wait_key
+
+ce_yes:
+    mov byte [confirm_choice], 1
+    jmp ce_end
+
+ce_no:
+    mov byte [confirm_choice], 0
+
+ce_end:
+    popa
+    mov al, [confirm_choice]
+    ret
+
+
+; redraw full scene (road, coins, blue cars, red car, HUD)
+redraw_full_scene:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    call draw_background
+
+    xor si, si
+rfs_coin_loop:
+    mov bx, si
+    shl bx, 1
+    cmp word [coin_active + bx], 0
+    je rfs_next_coin
+    mov ax, [coin_x + bx]
+    mov dx, [coin_y + bx]
+    call draw_coin_circle
+rfs_next_coin:
+    inc si
+    cmp si, 3
+    jb rfs_coin_loop
+
+    call draw_all_blue_cars
+
+    mov cx, [redx]
+    mov dx, [redy]
+    call draw_car_red
+
+    call draw_fuel_hud
+    call draw_coin_hud
+    call draw_fuel_text
 
     pop di
     pop si
@@ -1300,15 +2198,52 @@ fuel_col_loop:
     pop ax
     ret
 
-; RNG
-randstep:
-    mov ax, bx
-    shl bx, 5
-    add bx, ax
-    add bx, 7
-    mov ax, bx
+
+; game over text
+game_over_screen:
+    pusha
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 12
+    mov dl, 30
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Ch
+    mov si, msg_game_over
+gos_line1:
+    lodsb
+    or al, al
+    jz gos_line1_done
+    int 10h
+    jmp gos_line1
+gos_line1_done:
+
+    mov ah, 02h
+    xor bh, bh
+    mov dh, 14
+    mov dl, 24
+    int 10h
+
+    mov ah, 0Eh
+    mov bh, 0
+    mov bl, 0Fh
+    mov si, msg_press_key
+gos_line2:
+    lodsb
+    or al, al
+    jz gos_line2_done
+    int 10h
+    jmp gos_line2
+gos_line2_done:
+
+    popa
     ret
 
+
+; random number 0..BX-1, returns AX
 getrandom:
     push dx
     push cx
@@ -1318,7 +2253,7 @@ getrandom:
     jmp gr_exit
     
 gr_mod_ok:
-    mov ah, 00h
+    mov ah, 0
     int 1Ah
     mov ax, dx
     xor dx, dx
@@ -1330,8 +2265,10 @@ gr_exit:
     pop dx
     ret
 
-; sprites
-%include "car_red.inc"
+
+spawn_lane db 0
+; sprite data and size
+%include "redcar.inc"
 car_sprite_end:
 car_blue_sprite     equ car_sprite
 car_blue_sprite_end equ car_sprite_end
@@ -1345,6 +2282,9 @@ sprite_bytes equ car_sprite_end - car_sprite
  %endif
 %endif
 %endmacro
+tryw 14
+tryw 15 
+tryw 16
 tryw 45
 tryw 60
 tryw 56
@@ -1360,48 +2300,52 @@ CARW     equ _carw
 CARH     equ sprite_bytes / CARW
 CARHALFW equ (CARW/2)
 
+
 ; data
+
 lane1      dw 0
 lane2      dw 0
 redx       dw 0
 redy       dw 0
-colspan    dw 0
-rowspan    dw 0
 colstart   dw 0
 colend     dw 0
-rowmin     dw 0
-rowmax     dw 0
 lanec1     dw 0
 lanec2     dw 0
 lanec3     dw 0
 xminc      dw 0
 xmaxc      dw 0
 
-blue_lane         db 0
-bluex             dw 0
-bluey             dw 0
-blue_bottom       dw 0
-old_bluex         dw 0
-old_bluey         dw 0
-blue_spawn_active db 0       ; 1 while spawn phase
-blue_visible_rows dw 0       ; visible rows (now starts at CARH)
+; blue cars array: 14 bytes each
+; +0: active (word)
+; +2: x (word)
+; +4: y (word)
+; +6: bottom (word)
+; +8: lane (byte)
+; +10: old_x (word)
+; +12: old_y (word)
+blue_cars times (MAX_BLUE_CARS * 14) db 0
 
 coin_base_x  dw 0
 coin_base_y  dw 0
 
-spawn_timer  dw SPAWN_INTERVAL
+spawn_timer   dw 0
 
-; coin state
+red_lane      db 0
+red_left      dw 0
+red_right     dw 0
+red_top       dw 0
+red_bottom    dw 0
+
+game_over_flag dw 0
+
 coin_active dw 0, 0, 0
 coin_x     dw 0, 0, 0
 coin_y     dw 0, 0, 0
+coin_spawn_timer dw 0
 
-; old coin state (spare)
-old_coin_active dw 0, 0, 0
-old_coin_x      dw 0, 0, 0
-old_coin_y      dw 0, 0, 0
-
-coin_blue_offsets dw 16, 32, 48
+coin_count   dw 0
+fuel_value   dw 12
+digit_buf    times 5 db 0
 
 coin_mask dw 000000000000b, \
              000111111000b, \
@@ -1415,3 +2359,19 @@ coin_mask dw 000000000000b, \
              001111111100b, \
              000111111000b, \
              000000000000b
+
+msg_game_over      db 'GAME OVER',0
+msg_press_key      db 'Press any key to exit',0
+
+msg_title          db 'BITBLAZER',0
+msg_start_prompt   db 'Press S to start',0
+msg_confirm_exit   db 'Exit to DOS? (Y/N)',0
+confirm_choice     db 0
+
+msg_menu_play      db 'P - Play',0
+msg_menu_exit      db 'E - Exit',0
+msg_credit1        db '24L-0598 Hareem Ahmad',0
+msg_credit2        db '24L-0575 Laiba Fida',0
+
+msg_coins          db 'COINS: ',0
+msg_fuel           db 'FUEL: ',0
