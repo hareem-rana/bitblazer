@@ -53,4 +53,8 @@
 - The generated audio was converted and adapted for playback via the **PC speaker**.
 - Music is used for **demonstration and educational purposes only**.
 
+## License
+- This repository is licensed under the MIT License for the source code only. 
+- Third-party assets included in the executable remain subject to their original licenses.
+
 
